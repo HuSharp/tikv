@@ -802,6 +802,19 @@ where
             None => Err(Error::NotFound(format!("region {}", region_id))),
         }
     }
+
+    fn flashback_to_version2(&self) -> impl Future<Output = Result<()>> + Send {
+        let storage = Arc::new(Mutex::new(self.storage.clone().unwrap()));
+        async move {
+            let storage_clone = storage.lock().await;
+
+            let mut req = kvrpcpb::PrepareFlashbackToVersionRequest::new();
+            let resp = future_prepare_flashback_to_version2(&storage_clone, req.into())
+                .await
+                .unwrap();
+            Ok(())
+        }
+    }
 }
 
 impl<ER, E, L, K> Debugger for DebuggerImpl<ER, E, L, K>

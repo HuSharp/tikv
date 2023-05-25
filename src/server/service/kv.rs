@@ -1574,6 +1574,17 @@ fn future_delete_range<E: Engine, L: LockManager, F: KvFormat>(
     }
 }
 
+pub fn future_prepare_flashback_to_version2<E: Engine, L: LockManager, F: KvFormat>(
+    // Keep this param to hint the type of E for the compiler.
+    storage: &Storage<E, L, F>,
+    req: PrepareFlashbackToVersionRequest,
+) -> impl Future<Output = ServerResult<PrepareFlashbackToVersionResponse>> {
+    async move {
+        let resp = PrepareFlashbackToVersionResponse::default();
+        Ok(resp)
+    }
+}
+
 // Preparing the flashback for a region will "lock" the region so that
 // there is no any read, write or scheduling operation could be proposed before
 // the actual flashback operation.
