@@ -1060,7 +1060,6 @@ where
         {
             fatal!("failed to register debug service");
         }
-        info!("start register debug service");
 
         // Create Diagnostics service
         let diag_service = DiagnosticsService::new(

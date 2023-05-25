@@ -19,7 +19,6 @@ use kvproto::{
 use nom::AsBytes;
 use raft::prelude::Entry;
 use raftstore::store::util::check_key_in_region;
-use tokio::sync::mpsc::Sender;
 use txn_types::TimeStamp;
 
 use super::debug::{BottommostLevelCompaction, Debugger, RegionInfo};
@@ -455,7 +454,6 @@ impl<ER: RaftEngine> Debugger for DebuggerImplV2<ER> {
         _version: u64,
         _start_ts: TimeStamp,
         _commit_ts: TimeStamp,
-        _tx: Sender<u64>,
     ) -> Result<()> {
         unimplemented!()
     }
