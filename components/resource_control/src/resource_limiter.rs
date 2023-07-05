@@ -46,12 +46,10 @@ impl QuotaLimiter {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn get_rate_limit(&self) -> f64 {
         self.limiter.speed_limit()
     }
 
-    #[cfg(test)]
     pub(crate) fn set_rate_limit(&self, mut limit: f64) {
         // treat 0 as infinity.
         if limit <= f64::EPSILON {
@@ -94,6 +92,17 @@ impl std::ops::Sub for GroupStatistics {
         Self {
             total_consumed: self.total_consumed.saturating_sub(rhs.total_consumed),
             total_wait_dur_us: self.total_wait_dur_us.saturating_sub(rhs.total_wait_dur_us),
+        }
+    }
+}
+
+impl std::ops::Div<f64> for GroupStatistics {
+    type Output = Self;
+
+    fn div(self, rhs: f64) -> Self::Output {
+        Self {
+            total_consumed: (self.total_consumed as f64 / rhs) as u64,
+            total_wait_dur_us: (self.total_wait_dur_us as f64 / rhs) as u64,
         }
     }
 }

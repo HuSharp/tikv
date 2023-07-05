@@ -12,7 +12,7 @@ pub use resource_group::{
 };
 
 mod future;
-pub use future::ControlledFuture;
+pub use future::{ControlledFuture, LimitedFuture};
 
 #[cfg(test)]
 extern crate test;
@@ -23,7 +23,8 @@ pub use service::ResourceManagerService;
 pub mod channel;
 pub use channel::ResourceMetered;
 
-mod resource_limiter;
+pub mod resource_limiter;
+pub mod worker;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug, OnlineConfig)]
 #[serde(default)]

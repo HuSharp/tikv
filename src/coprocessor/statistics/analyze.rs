@@ -10,6 +10,7 @@ use kvproto::coprocessor::{KeyRange, Response};
 use mur3::Hasher128;
 use protobuf::Message;
 use rand::{rngs::StdRng, Rng};
+use resource_control::{resource_limiter::ResourceLimiter, LimitedFuture};
 use tidb_query_common::storage::{
     scanner::{RangesScanner, RangesScannerOptions},
     Range,
@@ -51,6 +52,7 @@ pub struct AnalyzeContext<S: Snapshot, F: KvFormat> {
     ranges: Vec<KeyRange>,
     storage_stats: Statistics,
     quota_limiter: Arc<QuotaLimiter>,
+    resource_limiter: Option<Arc<ResourceLimiter>>,
     is_auto_analyze: bool,
     _phantom: PhantomData<F>,
 }
@@ -63,6 +65,7 @@ impl<S: Snapshot, F: KvFormat> AnalyzeContext<S, F> {
         snap: S,
         req_ctx: &ReqContext,
         quota_limiter: Arc<QuotaLimiter>,
+        resource_limiter: Option<Arc<ResourceLimiter>>,
     ) -> Result<Self> {
         let store = SnapshotStore::new(
             snap,
@@ -81,6 +84,7 @@ impl<S: Snapshot, F: KvFormat> AnalyzeContext<S, F> {
             ranges,
             storage_stats: Statistics::default(),
             quota_limiter,
+            resource_limiter,
             is_auto_analyze,
             _phantom: PhantomData,
         })
@@ -232,12 +236,16 @@ impl<S: Snapshot, F: KvFormat> RequestHandler for AnalyzeContext<S, F> {
                     is_key_only: true,
                     is_scanned_range_aware: false,
                 });
-                let res = AnalyzeContext::handle_index(
+                let f = AnalyzeContext::handle_index(
                     req,
                     &mut scanner,
                     self.req.get_tp() == AnalyzeType::TypeCommonHandle,
-                )
-                .await;
+                );
+                let res = if let Some(ref limiter) = self.resource_limiter {
+                    LimitedFuture::new(f, limiter.clone()).await
+                } else {
+                    f.await
+                };
                 scanner.collect_storage_stats(&mut self.storage_stats);
                 res
             }
@@ -247,7 +255,12 @@ impl<S: Snapshot, F: KvFormat> RequestHandler for AnalyzeContext<S, F> {
                 let storage = self.storage.take().unwrap();
                 let ranges = std::mem::take(&mut self.ranges);
                 let mut builder = SampleBuilder::<_, F>::new(col_req, None, storage, ranges)?;
-                let res = AnalyzeContext::handle_column(&mut builder).await;
+                let f = AnalyzeContext::handle_column(&mut builder);
+                let res = if let Some(ref limiter) = self.resource_limiter {
+                    LimitedFuture::new(f, limiter.clone()).await
+                } else {
+                    f.await
+                };
                 builder.data.collect_storage_stats(&mut self.storage_stats);
                 res
             }
@@ -260,7 +273,12 @@ impl<S: Snapshot, F: KvFormat> RequestHandler for AnalyzeContext<S, F> {
                 let ranges = std::mem::take(&mut self.ranges);
                 let mut builder =
                     SampleBuilder::<_, F>::new(col_req, Some(idx_req), storage, ranges)?;
-                let res = AnalyzeContext::handle_mixed(&mut builder).await;
+                let f = AnalyzeContext::handle_mixed(&mut builder);
+                let res = if let Some(ref limiter) = self.resource_limiter {
+                    LimitedFuture::new(f, limiter.clone()).await
+                } else {
+                    f.await
+                };
                 builder.data.collect_storage_stats(&mut self.storage_stats);
                 res
             }
@@ -278,7 +296,12 @@ impl<S: Snapshot, F: KvFormat> RequestHandler for AnalyzeContext<S, F> {
                     self.is_auto_analyze,
                 )?;
 
-                let res = AnalyzeContext::handle_full_sampling(&mut builder).await;
+                let f = AnalyzeContext::handle_full_sampling(&mut builder);
+                let res = if let Some(ref limiter) = self.resource_limiter {
+                    LimitedFuture::new(f, limiter.clone()).await
+                } else {
+                    f.await
+                };
                 builder.data.collect_storage_stats(&mut self.storage_stats);
                 res
             }

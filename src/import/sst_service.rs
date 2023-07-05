@@ -25,6 +25,7 @@ use kvproto::{
     kvrpcpb::Context,
 };
 use raftstore_v2::StoreMeta;
+use resource_control::{LimitedFuture, ResourceGroupManager};
 use sst_importer::{
     error_inc, metrics::*, sst_importer::DownloadExt, sst_meta_to_path, Config, ConfigManager,
     Error, Result, SstImporter,
@@ -114,6 +115,7 @@ pub struct ImportSstService<E: Engine> {
     limiter: Limiter,
     task_slots: Arc<Mutex<HashSet<PathBuf>>>,
     raft_entry_max_size: ReadableSize,
+    resource_manager: Option<Arc<ResourceGroupManager>>,
 
     writer: raft_writer::ThrottledTlsEngineWriter,
 
@@ -300,6 +302,7 @@ impl<E: Engine> ImportSstService<E> {
         tablets: LocalTablets<E::Local>,
         importer: Arc<SstImporter>,
         store_meta: Option<Arc<Mutex<StoreMeta<E::Local>>>>,
+        resource_manager: Option<Arc<ResourceGroupManager>>,
     ) -> Self {
         let props = tikv_util::thread_group::current_properties();
         let eng = Mutex::new(engine.clone());
@@ -349,6 +352,7 @@ impl<E: Engine> ImportSstService<E> {
             raft_entry_max_size,
             writer,
             store_meta,
+            resource_manager,
         }
     }
 
@@ -631,14 +635,32 @@ macro_rules! impl_write {
 
             let timer = Instant::now_coarse();
             let label = stringify!($fn);
+            let resource_manager = self.resource_manager.clone();
             let handle_task = async move {
                 let res = async move {
                     let first_req = rx.try_next().await?;
-                    let meta = match first_req {
-                        Some(r) => match r.chunk {
-                            Some($chunk_ty::Meta(m)) => m,
-                            _ => return Err(Error::InvalidChunk),
-                        },
+                    let (meta, resource_limiter) = match first_req {
+                        Some(r) => {
+                            let limiter = if r
+                                .get_context()
+                                .get_resource_control_context()
+                                .get_is_background()
+                            {
+                                resource_manager.as_ref().and_then(|m| {
+                                    m.get_resource_limiter(
+                                        r.get_context()
+                                            .get_resource_control_context()
+                                            .get_resource_group_name(),
+                                    )
+                                })
+                            } else {
+                                None
+                            };
+                            match r.chunk {
+                                Some($chunk_ty::Meta(m)) => (m, limiter),
+                                _ => return Err(Error::InvalidChunk),
+                            }
+                        }
                         _ => return Err(Error::InvalidChunk),
                     };
                     let region_id = meta.get_region_id();
@@ -658,22 +680,43 @@ macro_rules! impl_write {
                             return Err(Error::InvalidChunk);
                         }
                     };
-                    let writer = rx
-                        .try_fold(writer, |mut writer, req| async move {
-                            // Migrated to 2021 migration. This let statement is probably not
-                            // needed, see   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
-                            let _ = &req;
-                            let batch = match req.chunk {
-                                Some($chunk_ty::Batch(b)) => b,
-                                _ => return Err(Error::InvalidChunk),
-                            };
-                            writer.write(batch)?;
-                            Ok(writer)
-                        })
+                    let (writer, limiter) = rx
+                        .try_fold(
+                            (writer, resource_limiter),
+                            |(mut writer, limiter), req| async move {
+                                // Migrated to 2021 migration. This let statement is probably not
+                                // needed, see   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
+                                let _ = &req;
+                                let batch = match req.chunk {
+                                    Some($chunk_ty::Batch(b)) => b,
+                                    _ => return Err(Error::InvalidChunk),
+                                };
+                                let f = async move {
+                                    writer.write(batch)?;
+                                    Ok(writer)
+                                };
+                                let writer_res = if let Some(ref limiter) = limiter {
+                                    LimitedFuture::new(f, limiter.clone()).await
+                                } else {
+                                    f.await
+                                };
+                                writer_res.map(|w| (w, limiter))
+                            },
+                        )
                         .await?;
 
-                    let metas = writer.finish()?;
-                    import.verify_checksum(&metas)?;
+                    let finish_fn = async {
+                        let metas = writer.finish()?;
+                        import.verify_checksum(&metas)?;
+                        Ok(metas)
+                    };
+
+                    let metas: Result<_> = if let Some(ref limiter) = limiter {
+                        LimitedFuture::new(finish_fn, limiter.clone()).await
+                    } else {
+                        finish_fn.await
+                    };
+                    let metas = metas?;
                     let mut resp = $resp_ty::default();
                     resp.set_metas(metas.into());
                     Ok(resp)
@@ -884,7 +927,21 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
         let region_id = req.get_sst().get_region_id();
         let tablets = self.tablets.clone();
         let start = Instant::now();
-
+        let resource_limiter = if req
+            .get_context()
+            .get_resource_control_context()
+            .get_is_background()
+        {
+            self.resource_manager.as_ref().and_then(|r| {
+                r.get_resource_limiter(
+                    req.get_context()
+                        .get_resource_control_context()
+                        .get_resource_group_name(),
+                )
+            })
+        } else {
+            None
+        };
         let handle_task = async move {
             // Records how long the download task waits to be scheduled.
             sst_importer::metrics::IMPORTER_DOWNLOAD_DURATION
@@ -914,7 +971,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
                 }
             };
 
-            let res = importer.download_ext::<E::Local>(
+            let dl_future = importer.download_ext::<E::Local>(
                 req.get_sst(),
                 req.get_storage_backend(),
                 req.get_name(),
@@ -926,8 +983,13 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
                     .cache_key(req.get_storage_cache_id())
                     .req_type(req.get_request_type()),
             );
+            let res = if let Some(limiter) = resource_limiter {
+                LimitedFuture::new(dl_future, limiter).await
+            } else {
+                dl_future.await
+            };
             let mut resp = DownloadResponse::default();
-            match res.await {
+            match res {
                 Ok(range) => match range {
                     Some(r) => resp.set_range(r),
                     None => resp.set_is_empty(true),

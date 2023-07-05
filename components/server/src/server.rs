@@ -71,6 +71,7 @@ use raftstore::{
 };
 use resolved_ts::LeadershipResolver;
 use resource_control::{
+    worker::{GroupQuotaAdjustWorker, BACKGROUND_LIMIT_ADJUST_DURATION},
     ResourceGroupManager, ResourceManagerService, MIN_PRIORITY_UPDATE_INTERVAL,
 };
 use security::SecurityManager;
@@ -305,8 +306,7 @@ where
 
         let resource_manager = if config.resource_control.enabled {
             let mgr = Arc::new(ResourceGroupManager::default());
-            let mut resource_mgr_service =
-                ResourceManagerService::new(mgr.clone(), pd_client.clone());
+            let resource_mgr_service = ResourceManagerService::new(mgr.clone(), pd_client.clone());
             // spawn a task to periodically update the minimal virtual time of all resource
             // groups.
             let resource_mgr = mgr.clone();
@@ -314,8 +314,19 @@ where
                 resource_mgr.advance_min_virtual_time();
             });
             // spawn a task to watch all resource groups update.
+            let mut resource_mgr_service_clone = resource_mgr_service.clone();
+            // spawn a task to watch all resource groups update.
             background_worker.spawn_async_task(async move {
-                resource_mgr_service.watch_resource_groups().await;
+                resource_mgr_service_clone.watch_resource_groups().await;
+            });
+            // spawn a task to auto adjust background quota limiter.
+            let io_bandwidth = config.storage.io_rate_limit.max_bytes_per_sec.0;
+            let mut worker = GroupQuotaAdjustWorker::new(mgr.clone(), io_bandwidth);
+            background_worker.spawn_interval_task(BACKGROUND_LIMIT_ADJUST_DURATION, move || {
+                worker.adjust_quota();
+            });
+            background_worker.spawn_async_task(async move {
+                resource_mgr_service.upload_ru_metrics().await;
             });
             Some(mgr)
         } else {
@@ -758,6 +769,7 @@ where
                 self.concurrency_manager.clone(),
                 resource_tag_factory,
                 self.quota_limiter.clone(),
+                self.resource_manager.clone(),
             ),
             coprocessor_v2::Endpoint::new(&self.core.config.coprocessor_v2),
             self.resolver.clone().unwrap(),
@@ -1033,6 +1045,7 @@ where
             LocalTablets::Singleton(engines.engines.kv.clone()),
             servers.importer.clone(),
             None,
+            self.resource_manager.clone(),
         );
         let import_cfg_mgr = import_service.get_config_manager();
 
@@ -1120,6 +1133,7 @@ where
             self.concurrency_manager.clone(),
             self.core.config.storage.api_version(),
             self.causal_ts_provider.clone(),
+            self.resource_manager.clone(),
         );
         self.cfg_controller.as_mut().unwrap().register(
             tikv::config::Module::Backup,

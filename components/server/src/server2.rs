@@ -67,6 +67,7 @@ use raftstore_v2::{
     StateStorage,
 };
 use resource_control::{
+    worker::{GroupQuotaAdjustWorker, BACKGROUND_LIMIT_ADJUST_DURATION},
     ResourceGroupManager, ResourceManagerService, MIN_PRIORITY_UPDATE_INTERVAL,
 };
 use security::SecurityManager;
@@ -299,6 +300,12 @@ where
             // spawn a task to watch all resource groups update.
             background_worker.spawn_async_task(async move {
                 resource_mgr_service.watch_resource_groups().await;
+            });
+            // spawn a task to auto adjust background quota limiter.
+            let io_bandwidth = config.storage.io_rate_limit.max_bytes_per_sec.0;
+            let mut worker = GroupQuotaAdjustWorker::new(mgr.clone(), io_bandwidth);
+            background_worker.spawn_interval_task(BACKGROUND_LIMIT_ADJUST_DURATION, move || {
+                worker.adjust_quota();
             });
             Some(mgr)
         } else {
@@ -722,6 +729,7 @@ where
                 self.concurrency_manager.clone(),
                 resource_tag_factory,
                 self.quota_limiter.clone(),
+                self.resource_manager.clone(),
             ),
             coprocessor_v2::Endpoint::new(&self.core.config.coprocessor_v2),
             self.resolver.clone().unwrap(),
@@ -890,6 +898,7 @@ where
             self.concurrency_manager.clone(),
             self.core.config.storage.api_version(),
             self.causal_ts_provider.clone(),
+            self.resource_manager.clone(),
         );
         self.cfg_controller.as_mut().unwrap().register(
             tikv::config::Module::Backup,
@@ -905,6 +914,7 @@ where
             LocalTablets::Registry(self.tablet_registry.as_ref().unwrap().clone()),
             servers.importer.clone(),
             Some(self.router.as_ref().unwrap().store_meta().clone()),
+            self.resource_manager.clone(),
         );
         let import_cfg_mgr = import_service.get_config_manager();
 

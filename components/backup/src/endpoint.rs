@@ -5,7 +5,7 @@ use std::{
     cell::RefCell,
     fmt,
     sync::{atomic::*, mpsc, Arc, Mutex, RwLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_channel::SendError;
@@ -24,6 +24,7 @@ use kvproto::{
 use online_config::OnlineConfig;
 use raft::StateRole;
 use raftstore::coprocessor::RegionInfoProvider;
+use resource_control::{resource_limiter::ResourceLimiter, LimitedFuture, ResourceGroupManager};
 use tikv::{
     config::BackupConfig,
     storage::{
@@ -54,6 +55,9 @@ use crate::{
 
 const BACKUP_BATCH_LIMIT: usize = 1024;
 
+// task yield duration when resource limit is on.
+const TASK_YIELD_DURATION: Duration = Duration::from_millis(10);
+
 #[derive(Clone)]
 struct Request {
     start_key: Vec<u8>,
@@ -71,6 +75,8 @@ struct Request {
     compression_level: i32,
     cipher: CipherInfo,
     replica_read: bool,
+    resource_group_name: String,
+    is_background: bool,
 }
 
 /// Backup Task.
@@ -132,6 +138,15 @@ impl Task {
                 compression_type: req.get_compression_type(),
                 compression_level: req.get_compression_level(),
                 replica_read: req.get_replica_read(),
+                is_background: req
+                    .get_context()
+                    .get_resource_control_context()
+                    .get_is_background(),
+                resource_group_name: req
+                    .get_context()
+                    .get_resource_control_context()
+                    .get_resource_group_name()
+                    .to_owned(),
                 cipher: req.cipher_info.unwrap_or_else(|| {
                     let mut cipher = CipherInfo::default();
                     cipher.set_cipher_type(EncryptionMethod::Plaintext);
@@ -192,7 +207,6 @@ impl<EK: KvEngine> KvWriter<EK> {
     }
 }
 
-#[derive(Debug)]
 struct InMemBackupFiles<EK: KvEngine> {
     files: KvWriter<EK>,
     start_key: Vec<u8>,
@@ -200,6 +214,20 @@ struct InMemBackupFiles<EK: KvEngine> {
     start_version: TimeStamp,
     end_version: TimeStamp,
     region: Region,
+    limiter: Option<Arc<ResourceLimiter>>,
+}
+
+impl<EK: KvEngine> std::fmt::Debug for InMemBackupFiles<EK> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemBackupFiles")
+            .field("files", &self.files)
+            .field("start_key", &self.start_key)
+            .field("end_key", &self.end_key)
+            .field("start_version", &self.start_version)
+            .field("end_version", &self.end_version)
+            .field("region", &self.region)
+            .finish()
+    }
 }
 
 async fn save_backup_file_worker<EK: KvEngine>(
@@ -210,7 +238,14 @@ async fn save_backup_file_worker<EK: KvEngine>(
 ) {
     while let Ok(msg) = rx.recv().await {
         let files = if msg.files.need_flush_keys() {
-            match msg.files.save(&storage).await {
+            let limiter = msg.limiter.clone();
+            let f = msg.files.save(&storage);
+            let res = if let Some(limiter) = limiter {
+                LimitedFuture::new(f, limiter).await
+            } else {
+                f.await
+            };
+            match res {
                 Ok(mut split_files) => {
                     let mut has_err = false;
                     for file in split_files.iter_mut() {
@@ -300,6 +335,7 @@ impl BackupRange {
         begin_ts: TimeStamp,
         saver: async_channel::Sender<InMemBackupFiles<E::Local>>,
         storage_name: &str,
+        resource_limiter: Option<Arc<ResourceLimiter>>,
     ) -> Result<Statistics> {
         assert!(!self.codec.is_raw_kv);
 
@@ -381,6 +417,7 @@ impl BackupRange {
             .clone()
             .map_or_else(Vec::new, |k| k.into_raw().unwrap());
         let mut writer = writer_builder.build(next_file_start_key.clone(), storage_name)?;
+        let mut start_time = Instant::now_coarse();
         loop {
             if let Err(e) = scanner.scan_entries(&mut batch) {
                 error!(?e; "backup scan entries failed");
@@ -410,6 +447,7 @@ impl BackupRange {
                     start_version: begin_ts,
                     end_version: backup_ts,
                     region: self.region.clone(),
+                    limiter: resource_limiter.clone(),
                 };
                 send_to_worker_with_metrics(&saver, msg).await?;
                 next_file_start_key = this_end_key;
@@ -425,6 +463,11 @@ impl BackupRange {
             if let Err(e) = writer.write(entries, true) {
                 error_unknown!(?e; "backup build sst failed");
                 return Err(e);
+            }
+            if resource_limiter.is_some() && start_time.saturating_elapsed() >= TASK_YIELD_DURATION
+            {
+                tokio::task::yield_now().await;
+                start_time = Instant::now_coarse();
             }
         }
         drop(snap_store);
@@ -453,6 +496,7 @@ impl BackupRange {
             start_version: begin_ts,
             end_version: backup_ts,
             region: self.region.clone(),
+            limiter: resource_limiter.clone(),
         };
         send_to_worker_with_metrics(&saver, msg).await?;
 
@@ -586,6 +630,7 @@ impl BackupRange {
             start_version: TimeStamp::zero(),
             end_version: TimeStamp::zero(),
             region: self.region.clone(),
+            limiter: None,
         };
         send_to_worker_with_metrics(&saver_tx, msg).await?;
         Ok(stat)
@@ -684,6 +729,7 @@ pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static> {
     softlimit: SoftLimitKeeper,
     api_version: ApiVersion,
     causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used in rawkv apiv2 only
+    resource_ctl: Option<Arc<ResourceGroupManager>>,
 
     pub(crate) engine: E,
     pub(crate) region_info: R,
@@ -838,6 +884,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         concurrency_manager: ConcurrencyManager,
         api_version: ApiVersion,
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
+        resource_ctl: Option<Arc<ResourceGroupManager>>,
     ) -> Endpoint<E, R> {
         let pool = ControlThreadPool::new();
         let rt = utils::create_tokio_runtime(config.io_thread_size, "backup-io").unwrap();
@@ -856,6 +903,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
             concurrency_manager,
             api_version,
             causal_ts_provider,
+            resource_ctl,
         }
     }
 
@@ -897,6 +945,13 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         let batch_size = self.config_manager.0.read().unwrap().batch_size;
         let sst_max_size = self.config_manager.0.read().unwrap().sst_max_size.0;
         let limit = self.softlimit.limit();
+        let resource_limiter: Option<Arc<ResourceLimiter>> = if request.is_background {
+            self.resource_ctl
+                .as_ref()
+                .and_then(|r| r.get_resource_limiter(&request.resource_group_name))
+        } else {
+            None
+        };
 
         self.pool.borrow_mut().spawn(async move {
             // Migrated to 2021 migration. This let statement is probably not needed, see
@@ -982,7 +1037,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             sst_max_size,
                             request.cipher.clone(),
                         );
-                        brange
+                        let f= brange
                             .backup(
                                 writer_builder,
                                 engine,
@@ -991,8 +1046,13 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                                 start_ts,
                                 saver_tx.clone(),
                                 _backend.name(),
-                            )
-                            .await
+                                resource_limiter.clone()
+                            );
+                        if let Some(ref rl) = resource_limiter {
+                            LimitedFuture::new(f, rl.clone()).await
+                        } else {
+                            f.await
+                        }
                     };
                     match stat {
                         Err(err) => {

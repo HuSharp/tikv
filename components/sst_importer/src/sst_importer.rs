@@ -1251,6 +1251,8 @@ impl SstImporter {
             .build(path.save.to_str().unwrap())
             .unwrap();
 
+        let mut start = Instant::now_coarse();
+        let mut count = 0;
         while iter.valid()? {
             let mut old_key = Cow::Borrowed(keys::origin_key(iter.key()));
             let mut ts = None;
@@ -1314,6 +1316,12 @@ impl SstImporter {
             }
 
             sst_writer.put(&data_key, &value)?;
+            count += 1;
+            if count >= 1024 && start.saturating_elapsed() >= Duration::from_millis(10) {
+                tokio::task::yield_now().await;
+                count = 0;
+                start = Instant::now_coarse();
+            }
             iter.next()?;
             if first_key.is_none() {
                 first_key = Some(keys::origin_key(&data_key).to_vec());

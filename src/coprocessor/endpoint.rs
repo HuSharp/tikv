@@ -12,9 +12,12 @@ use async_stream::try_stream;
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::PerfLevel;
 use futures::{channel::mpsc, future::Either, prelude::*};
-use kvproto::{coprocessor as coppb, errorpb, kvrpcpb};
+use kvproto::{
+    coprocessor as coppb, errorpb,
+    kvrpcpb::self,
+};
 use protobuf::{CodedInputStream, Message};
-use resource_control::TaskMetadata;
+use resource_control::{ResourceGroupManager, TaskMetadata};
 use resource_metering::{FutureExt, ResourceTagFactory, StreamExt};
 use tidb_query_common::execute_stats::ExecSummary;
 use tikv_alloc::trace::MemoryTraceGuard;
@@ -70,6 +73,7 @@ pub struct Endpoint<E: Engine> {
     slow_log_threshold: Duration,
 
     quota_limiter: Arc<QuotaLimiter>,
+    resource_ctl: Option<Arc<ResourceGroupManager>>,
 
     _phantom: PhantomData<E>,
 }
@@ -83,6 +87,7 @@ impl<E: Engine> Endpoint<E> {
         concurrency_manager: ConcurrencyManager,
         resource_tag_factory: ResourceTagFactory,
         quota_limiter: Arc<QuotaLimiter>,
+        resource_ctl: Option<Arc<ResourceGroupManager>>,
     ) -> Self {
         // FIXME: When yatp is used, we need to limit coprocessor requests in progress
         // to avoid using too much memory. However, if there are a number of large
@@ -106,6 +111,7 @@ impl<E: Engine> Endpoint<E> {
             max_handle_duration: cfg.end_point_request_max_handle_duration.0,
             slow_log_threshold: cfg.end_point_slow_log_threshold.0,
             quota_limiter,
+            resource_ctl,
             _phantom: Default::default(),
         }
     }
@@ -190,6 +196,20 @@ impl<E: Engine> Endpoint<E> {
 
         let mut req_ctx: ReqContext;
         let builder: RequestHandlerBuilder<E::Snap>;
+        let resource_limiter = if context
+            .get_resource_control_context()
+            .get_is_background()
+        {
+            self.resource_ctl.as_ref().and_then(|r| {
+                r.get_resource_limiter(
+                    context
+                        .get_resource_control_context()
+                        .get_resource_group_name(),
+                )
+            })
+        } else {
+            None
+        };
 
         match req.get_tp() {
             REQ_TYPE_DAG => {
@@ -259,6 +279,7 @@ impl<E: Engine> Endpoint<E> {
                         req.get_is_cache_enabled(),
                         paging_size,
                         quota_limiter,
+                        resource_limiter,
                     )
                     .data_version(data_version)
                     .build()
@@ -305,6 +326,7 @@ impl<E: Engine> Endpoint<E> {
                         snap,
                         req_ctx,
                         quota_limiter,
+                        resource_limiter,
                     )
                     .map(|h| h.into_boxed())
                 });
@@ -350,6 +372,7 @@ impl<E: Engine> Endpoint<E> {
                         start_ts,
                         snap,
                         req_ctx,
+                        resource_limiter,
                     )
                     .map(|h| h.into_boxed())
                 });
@@ -1030,6 +1053,7 @@ mod tests {
             cm,
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
 
         // a normal request
@@ -1071,6 +1095,7 @@ mod tests {
             cm,
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
         copr.recursion_limit = 100;
 
@@ -1109,6 +1134,7 @@ mod tests {
             cm,
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
 
         let mut req = coppb::Request::default();
@@ -1132,6 +1158,7 @@ mod tests {
             cm,
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
 
         let mut req = coppb::Request::default();
@@ -1180,6 +1207,7 @@ mod tests {
             cm,
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
 
         let (tx, rx) = mpsc::channel();
@@ -1231,6 +1259,7 @@ mod tests {
             cm,
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
 
         let handler_builder =
@@ -1256,6 +1285,7 @@ mod tests {
             cm,
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
 
         // Fail immediately
@@ -1309,6 +1339,7 @@ mod tests {
             cm,
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
 
         let handler_builder = Box::new(|_, _: &_| Ok(StreamFixture::new(vec![]).into_boxed()));
@@ -1337,6 +1368,7 @@ mod tests {
             cm,
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
 
         // handler returns `finished == true` should not be called again.
@@ -1436,6 +1468,7 @@ mod tests {
             cm,
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
 
         let counter = Arc::new(atomic::AtomicIsize::new(0));
@@ -1505,6 +1538,7 @@ mod tests {
             cm,
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1884,6 +1918,7 @@ mod tests {
             cm,
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
 
         {
@@ -1949,6 +1984,7 @@ mod tests {
             cm,
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
+            None,
         );
         let mut req = coppb::Request::default();
         req.mut_context().set_isolation_level(IsolationLevel::Si);

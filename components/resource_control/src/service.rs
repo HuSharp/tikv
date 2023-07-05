@@ -1,13 +1,23 @@
 // Copyright 2023 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Sub,
+    sync::Arc,
+    time::Duration,
+};
 
 use futures::{compat::Future01CompatExt, StreamExt};
-use kvproto::{pdpb::EventType, resource_manager::ResourceGroup};
+use kvproto::{
+    pdpb::EventType,
+    resource_manager::{
+        Consumption, RequestUnitItem, ResourceGroup, TokenBucketRequest, TokenBucketsRequest, RequestUnitType,
+    },
+};
 use pd_client::{Error as PdError, PdClient, RpcClient, RESOURCE_CONTROL_CONFIG_PATH};
-use tikv_util::{error, timer::GLOBAL_TIMER_HANDLE};
+use tikv_util::{error, info, timer::GLOBAL_TIMER_HANDLE};
 
-use crate::ResourceGroupManager;
+use crate::{resource_limiter::GroupStatistics, worker::GroupStats, ResourceGroupManager};
 
 #[derive(Clone)]
 pub struct ResourceManagerService {
@@ -32,6 +42,7 @@ impl ResourceManagerService {
 }
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1); // to consistent with pd_client
+pub const BACKGROUND_RU_UPLOAD_DURATION: Duration = Duration::from_secs(5); // to consistent with pd_client
 
 impl ResourceManagerService {
     pub async fn watch_resource_groups(&mut self) {
@@ -137,6 +148,94 @@ impl ResourceManagerService {
                         .await;
                 }
             }
+        }
+    }
+
+    // upload ru metrics
+    pub async fn upload_ru_metrics(&self) {
+        info!("start to upload ru metrics");
+        let mut check_map: HashMap<String, Consumption> = HashMap::new();
+        loop {
+            let background_groups: Vec<_> = self
+                .manager
+                .resource_groups
+                .iter()
+                .filter_map(|kv| {
+                    let g = kv.value();
+                    g.limiter.as_ref().map(|limiter| GroupStats {
+                        name: g.group.name.clone(),
+                        ru_quota: g.get_ru_quota() as f64,
+                        limiter: limiter.clone(),
+                        stats: GroupStatistics::default(),
+                        expect_cost_per_ru: 0.0,
+                    })
+                })
+                .collect();
+            if background_groups.is_empty() {
+                let _ = GLOBAL_TIMER_HANDLE
+                    .delay(std::time::Instant::now() + BACKGROUND_RU_UPLOAD_DURATION)
+                    .compat()
+                    .await;
+                continue;
+            }
+
+            info!("[upload ru metrics] background_groups len is"; "background_groups" => background_groups.len());
+
+            let mut req = TokenBucketsRequest::default();
+            req.set_background(true);
+            let all_reqs = req.mut_requests();
+            background_groups.iter().for_each(|g| {
+                let mut req = TokenBucketRequest::default();
+                req.set_resource_group_name(g.name.clone());
+
+                let report_comsuption = req.mut_consumption_since_last_request();
+                if let Some(last_comsuption) = check_map.get_mut(g.name.as_str()) {
+                    let mut cpu_stats = (g.limiter.cpu_limiter.get_statistics().total_consumed
+                        as f64)
+                        .sub(last_comsuption.get_r_r_u());
+                    if cpu_stats < 0.0 {
+                        cpu_stats = 0.0;
+                    }
+                    let mut io_stats = (g.limiter.io_limiter.get_statistics().total_consumed
+                        as f64)
+                        .sub(last_comsuption.get_w_r_u());
+                    if io_stats < 0.0 {
+                        io_stats = 0.0;
+                    }
+
+                    report_comsuption.set_r_r_u(cpu_stats);
+                    report_comsuption.set_w_r_u(io_stats);
+
+                    last_comsuption
+                        .set_r_r_u(g.limiter.cpu_limiter.get_statistics().total_consumed as f64);
+                    last_comsuption
+                        .set_w_r_u(g.limiter.io_limiter.get_statistics().total_consumed as f64);
+                } else {
+                    check_map.insert(g.name.clone(), report_comsuption.clone());
+                }
+
+                let r = req.mut_ru_items();
+                let mut item = RequestUnitItem::default();
+                item.set_type(RequestUnitType::Ru);
+                item.set_value(g.ru_quota);
+                r.request_r_u.push(item);
+
+                all_reqs.push(req);
+            });
+
+            info!("[upload ru metrics] all_reqs is"; "all_reqs" => ?all_reqs);
+
+            match self.pd_client.upload_ru_metrics(req).await {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("upload ru metrics failed"; "err" => ?e);
+                }
+            }
+
+            let _ = GLOBAL_TIMER_HANDLE
+                .delay(std::time::Instant::now() + BACKGROUND_RU_UPLOAD_DURATION)
+                .compat()
+                .await;
         }
     }
 }

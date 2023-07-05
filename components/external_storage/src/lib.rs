@@ -262,6 +262,27 @@ pub fn encrypt_wrap_reader(
     Ok(input)
 }
 
+struct RescheduleChecker {
+    dur: Duration,
+    start: Instant,
+}
+
+impl RescheduleChecker {
+    fn new(dur: Duration) -> Self {
+        Self {
+            dur,
+            start: Instant::now(),
+        }
+    }
+
+    async fn check(&mut self) {
+        if self.start.saturating_elapsed() >= self.dur {
+            tokio::task::yield_now().await;
+            self.start = Instant::now();
+        }
+    }
+}
+
 pub async fn read_external_storage_into_file<In, Out>(
     mut input: In,
     mut output: Out,
@@ -286,6 +307,7 @@ where
         )
     })?;
 
+    let mut yield_checker = RescheduleChecker::new(Duration::from_millis(10));
     loop {
         // separate the speed limiting from actual reading so it won't
         // affect the timeout calculation.
@@ -306,6 +328,7 @@ where
             })?;
         }
         file_length += bytes_read as u64;
+        yield_checker.check().await;
     }
 
     if expected_length != 0 && expected_length != file_length {

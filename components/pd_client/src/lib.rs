@@ -21,6 +21,7 @@ use futures::future::BoxFuture;
 use kvproto::{
     metapb, pdpb,
     replication_modepb::{RegionReplicationStatus, ReplicationStatus, StoreDrAutoSyncStatus},
+    resource_manager::TokenBucketsRequest,
 };
 use pdpb::QueryStats;
 use tikv_util::time::{Instant, UnixSecs};
@@ -519,6 +520,10 @@ pub trait PdClient: Send + Sync {
 
     /// Region's Leader uses this to report buckets to PD.
     fn report_region_buckets(&self, _bucket_stat: &BucketStat, _period: Duration) -> PdFuture<()> {
+        unimplemented!();
+    }
+
+    fn upload_ru_metrics(&self, _req: TokenBucketsRequest) -> PdFuture<()> {
         unimplemented!();
     }
 }
