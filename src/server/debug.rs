@@ -1008,6 +1008,9 @@ async fn async_key_range_flashback_to_version<E: Engine, L: LockManager, F: KvFo
     let end_key = Key::from_encoded_slice(&end_key)
         .to_raw()
         .unwrap_or_default();
+    if start_key != region.start_key || end_key != region.end_key {
+        return Err(Error::FlashbackFailed("key range not match".to_owned()));
+    }
 
     // Means now is prepare flashback.
     if in_prepare_state {
