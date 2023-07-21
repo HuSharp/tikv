@@ -821,7 +821,7 @@ fn flashback_whole_cluster(
                 let addr = pd_client.get_store(s.get_id()).unwrap().address;
                 // Flashback to version by key range.
                 let cfg_inner = cfg.clone();
-                let mgr = Arc::clone(&mgr);  
+                let mgr = Arc::clone(&mgr);
                 let debug_executor = new_debug_executor(&cfg_inner, None, false, Some(&addr), mgr);
                 (s.get_id(), debug_executor)
             } )

@@ -1008,9 +1008,6 @@ async fn async_key_range_flashback_to_version<E: Engine, L: LockManager, F: KvFo
     let end_key = Key::from_encoded_slice(&end_key)
         .to_raw()
         .unwrap_or_default();
-    if start_key != region.start_key || end_key != region.end_key {
-        return Err(Error::FlashbackFailed("key range not match".to_owned()));
-    }
 
     // Means now is prepare flashback.
     if in_prepare_state {
@@ -1021,6 +1018,7 @@ async fn async_key_range_flashback_to_version<E: Engine, L: LockManager, F: KvFo
         req.set_context(ctx.clone());
         req.set_start_ts(start_ts);
 
+        info!("send prepare flashback req to version"; "req" => ?req);
         let resp = future_prepare_flashback_to_version(storage, req)
             .await
             .unwrap();
@@ -1039,6 +1037,7 @@ async fn async_key_range_flashback_to_version<E: Engine, L: LockManager, F: KvFo
         req.set_start_ts(start_ts);
         req.set_commit_ts(commit_ts);
 
+        info!("send finish flashback req to version"; "req" => ?req);
         let resp = future_flashback_to_version(storage, req).await.unwrap();
         if !resp.get_error().is_empty() || resp.has_region_error() {
             error!("exec finish flashback failed"; "err" => ?resp.get_error(), "region_err" => ?resp.get_region_error());
